@@ -14,8 +14,6 @@
 #define CLEANMASK(mask) (mask & ~(numlockmask | LockMask))
 #define TABLENGTH(X)    (sizeof(X)/sizeof(*X))
 
-#define RESIZEMOVEKEY Mod1Mask
-
 typedef union {
     const char** com;
     const int a;
@@ -32,6 +30,7 @@ typedef struct {
 typedef struct client client;
 struct client {
     Window win;
+    unsigned int x, y, w, h, fscreen;
 };
 
 typedef struct {
@@ -39,7 +38,7 @@ typedef struct {
 } record;
 
 typedef struct {
-    record drec[10];
+    record drec[10]; // Limit of ten windows per desktop
     unsigned int current, numwins;
 } Desktop;
 
@@ -49,25 +48,34 @@ static void buttonrelease(XEvent *e);
 static void change_desktop(const Arg arg);
 static void configurerequest(XEvent *e);
 static void destroynotify(XEvent *e);
+static void follow_to_desktop(const Arg arg);
+static void fullscreen();
 static void grabkeys();
 static void keypress(XEvent *e);
+static void kill_client();
 static void maprequest(XEvent *e);
 static void motionnotify(XEvent *e);
 static void next_win();
 static void quit();
 static void remove_client(unsigned int e, unsigned int dr);
+static void resize_width(const Arg arg);
+static void resize_height(const Arg arg);
 static void save_desktop(unsigned int a);
 static void select_desktop(unsigned int a);
 static void send_to_desktop(const Arg arg);
+static void send_kill_signal(Window w);
 static void setup();
 static void sigchld();
 static void spawn(const Arg arg);
 static void startup();
 static void update_current();
+static void window_x(const Arg arg);
+static void window_y(const Arg arg);
+static unsigned long getcolor(const char* color);
 
 #include "config.h"
 
-static Display * dis;
+static Display *dis;
 static int xerror(Display *dis, XErrorEvent *ee);
 static int (*xerrorxlib)(Display *, XErrorEvent *ee);
 static Window root;
@@ -75,9 +83,9 @@ static XWindowAttributes attr;
 static XButtonEvent start;
 
 static unsigned int stop_running, numwins, current, numlockmask, i, cd, doresize;
-static unsigned int sw, sh;
+static unsigned int sw, sh, win_focus, win_unfocus;
 
-static record rec[10];
+static record rec[10]; // Limit of ten windows per desktop
 static Desktop desk[DESKS];
 
 /************************* Window Management *************/
@@ -88,13 +96,22 @@ void add_window(Window win, unsigned int da, client *cl) {
             puts("CALLOC ERROR");
             exit (1);
         }
-    } else c = cl;
-    c->win = win;
-    rec[numwins].cl = c;
+        c->win = win;
+        rec[numwins].cl = c;
+        XGetWindowAttributes(dis, rec[numwins].cl->win, &attr);
+        if(attr.x < 20 || attr.y < 20) {
+            XMoveWindow(dis, rec[numwins].cl->win, numwins*10+100, numwins*10+100);
+            XGetWindowAttributes(dis, rec[numwins].cl->win, &attr);
+        }
+        rec[numwins].cl->x = attr.x;
+        rec[numwins].cl->y = attr.y;
+        rec[numwins].cl->w = attr.width;
+        rec[numwins].cl->h = attr.height;
+    } else rec[numwins].cl = cl;
     current = numwins;
-
+    XMapWindow(dis, rec[current].cl->win);
     ++numwins;
-    save_desktop(cd);
+    update_current();
     return;
 }
 
@@ -104,31 +121,72 @@ void remove_client(unsigned int e, unsigned int dr) {
     if(dr == 0) free(rec[e].cl);
     for(i=e;i<numwins;++i)
         rec[i].cl = rec[i+1].cl;
+    rec[numwins-1].cl = NULL;
     --numwins;
-    current = (e > 0) ? e-1: 0;
     update_current();
-    save_desktop(cd);
     return;
 }
 
 void update_current() {
     if(numwins < 1) return;
-    for(i=0;i<numwins;i++)
-        if(i != current) {
-            XGrabButton(dis, AnyButton, AnyModifier, rec[i].cl->win, True, ButtonPressMask|ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None, None);
-            XSetWindowBorderWidth(dis,rec[i].cl->win,0);
-        }
-    XSetWindowBorderWidth(dis,rec[current].cl->win,2);
-    XSetWindowBorder(dis,rec[current].cl->win,0);
+
+    rec[numwins].cl = rec[current].cl;
+    for(i=numwins-1;i>0;--i) {
+        if(i <= current)
+            rec[i].cl = rec[i-1].cl;
+        XGrabButton(dis, AnyButton, AnyModifier, rec[i].cl->win, True, ButtonPressMask|ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None, None);
+        XSetWindowBorderWidth(dis,rec[i].cl->win,BORDER_WIDTH);
+        XSetWindowBorder(dis,rec[i].cl->win,win_unfocus);
+    }
+
+    current = 0;
+    rec[current].cl = rec[numwins].cl;
+    rec[numwins].cl = NULL;
     XUngrabButton(dis, AnyButton, AnyModifier, rec[current].cl->win);
+    XSetWindowBorderWidth(dis,rec[current].cl->win,BORDER_WIDTH);
+    XSetWindowBorder(dis,rec[current].cl->win,win_focus);
     XSetInputFocus(dis,rec[current].cl->win,RevertToParent,CurrentTime);
     XRaiseWindow(dis, rec[current].cl->win);
+    save_desktop(cd);
 }
 
 void next_win() {
-    current = (current+1 < numwins) ? current+1: 0;
+    current = numwins-1;
     update_current();
-    save_desktop(cd);
+}
+
+void fullscreen() {
+    if(rec[0].cl->fscreen == 0) {
+        XMoveResizeWindow(dis,rec[0].cl->win,0,0,sw,sh);
+        rec[0].cl->fscreen = 1;
+    } else {
+        XMoveResizeWindow(dis,rec[0].cl->win,rec[0].cl->x,rec[0].cl->y,rec[0].cl->w,rec[0].cl->h);
+        rec[0].cl->fscreen = 0;
+    }
+}
+
+void window_x(const Arg arg) {
+    if(numwins < 1) return;
+    rec[0].cl->x += arg.a;
+    XMoveResizeWindow(dis,rec[0].cl->win,rec[0].cl->x,rec[0].cl->y,rec[0].cl->w,rec[0].cl->h);
+}
+
+void window_y(const Arg arg) {
+    if(numwins < 1) return;
+    rec[0].cl->y += arg.a;
+    XMoveResizeWindow(dis,rec[0].cl->win,rec[0].cl->x,rec[0].cl->y,rec[0].cl->w,rec[0].cl->h);
+}
+
+void resize_width(const Arg arg) {
+    if(numwins < 1) return;
+    rec[0].cl->w += arg.a;
+    XMoveResizeWindow(dis,rec[0].cl->win,rec[0].cl->x,rec[0].cl->y,rec[0].cl->w,rec[0].cl->h);
+}
+
+void resize_height(const Arg arg) {
+    if(numwins < 1) return;
+    rec[0].cl->h += arg.a;
+    XMoveResizeWindow(dis,rec[0].cl->win,rec[0].cl->x,rec[0].cl->y,rec[0].cl->w,rec[0].cl->h);
 }
 
 /************************* DESKTOP *********************/
@@ -159,6 +217,13 @@ void send_to_desktop(const Arg arg) {
     update_current();
 }
 
+void follow_to_desktop(const Arg arg) {
+    if(arg.a == cd || numwins == 0) return;
+
+    send_to_desktop(arg);
+    change_desktop(arg);
+}
+
 void save_desktop(unsigned int a) {
     for(i=0;i<TABLENGTH(rec);++i)
         desk[a].drec[i] = rec[i];
@@ -185,7 +250,7 @@ void grabkeys() {
     numlockmask = 0;
     modmap = XGetModifierMapping(dis);
     for (i = 0; i < 8; i++) {
-        for (j = 0; j < modmap->max_keypermod; j++) {
+        for (j = 0; j < modmap->max_keypermod; ++j) {
             if(modmap->modifiermap[i * modmap->max_keypermod + j] == XKeysymToKeycode(dis, XStringToKeysym("Num_Lock")))
                 numlockmask = (1 << i);
         }
@@ -246,6 +311,14 @@ void buttonpress(XEvent *e) {
 
 void buttonrelease(XEvent *e) {
     XUngrabPointer(dis, CurrentTime);
+    for(i=0;i<numwins;++i)
+        if(rec[i].cl->win == e->xbutton.subwindow) {
+            XGetWindowAttributes(dis, rec[numwins].cl->win, &attr);
+            rec[i].cl->x = attr.x;
+            rec[i].cl->y = attr.y;
+            rec[i].cl->w = attr.width;
+            rec[i].cl->h = attr.height;
+        }
     doresize = 0;
 }
 
@@ -260,10 +333,8 @@ void configurerequest(XEvent *e) {
     wc.sibling = e->xconfigurerequest.above;
     wc.stack_mode = e->xconfigurerequest.detail;
     XConfigureWindow(dis, e->xconfigurerequest.window, e->xconfigurerequest.value_mask, &wc);
-    
     XSync(dis, False);
 }
-
 
 void destroynotify(XEvent *e) {
     unsigned int j, tmp = cd;
@@ -280,14 +351,23 @@ void destroynotify(XEvent *e) {
     select_desktop(tmp);
 }
 
+unsigned long getcolor(const char* color) {
+    XColor c;
+    Colormap map = DefaultColormap(dis,DefaultScreen(dis));
+
+    if(!XAllocNamedColor(dis,map,color,&c,&c))
+        puts("\033[0;31mMINIME : Error parsing color!");
+
+    return c.pixel;
+}
+
+void kill_client() {
+    send_kill_signal(rec[current].cl->win);
+}
+
 void maprequest(XEvent *e) {
-    XGetWindowAttributes(dis, e->xmaprequest.window, &attr);
     if(attr.override_redirect == True) return;
     add_window(e->xmaprequest.window,0,NULL);
-    if(attr.x < 10 || attr.y < 10)
-        XMoveWindow(dis, e->xmaprequest.window, numwins*10+100, numwins*10+100);
-    XMapWindow(dis, e->xmaprequest.window);
-    update_current();
 }
 
 void motionnotify(XEvent *e) {
@@ -325,7 +405,10 @@ int xerror(Display *dis, XErrorEvent *ee) {
     || (ee->request_code == X_GrabKey && ee->error_code == BadAccess)
     || (ee->request_code == X_CopyArea && ee->error_code == BadDrawable))
         return 0;
-    puts("\033[0;31mBad Window Error!\033[0m");
+    if(ee->error_code == BadAccess) {
+        puts("\033[0;31mIs Another Window Manager Running? Exiting!");
+        exit(1);
+    } else puts("\033[0;31mMINIME : Bad Window Error!\033[0m");
     return xerrorxlib(dis, ee); /* may call exit */
 }
 
@@ -340,6 +423,9 @@ static void setup() {
     root = DefaultRootWindow(dis);
     sw = XDisplayWidth(dis,DefaultScreen(dis));
     sh = XDisplayHeight(dis,DefaultScreen(dis));
+    // Colors
+    win_focus = getcolor(FOCUS);
+    win_unfocus = getcolor(UNFOCUS);
     grabkeys();
     doresize = numwins = 0;
     rec[0].cl = NULL;
@@ -370,13 +456,36 @@ void startup() {
 }
 
 void quit() {
+    Window root_return, parent, *children;
+    unsigned int nchildren, i;
+
+    XQueryTree(dis, root, &root_return, &parent, &children, &nchildren);
+    for(i = 0; i < nchildren; i++)
+        send_kill_signal(children[i]);
+
+    XClearWindow(dis, root);
+    XUngrabKey(dis, AnyKey, AnyModifier, root);
+    XSync(dis, False);
+    XSetInputFocus(dis, root, RevertToPointerRoot, CurrentTime);
+    fputs("MINIME : you quit, bye !\n", stderr);
     stop_running = 1;
+}
+
+void send_kill_signal(Window w) {
+    XEvent ke;
+    ke.type = ClientMessage;
+    ke.xclient.window = w;
+    ke.xclient.message_type = XInternAtom(dis, "WM_PROTOCOLS", True);
+    ke.xclient.format = 32;
+    ke.xclient.data.l[0] = XInternAtom(dis, "WM_DELETE_WINDOW", True);
+    ke.xclient.data.l[1] = CurrentTime;
+    XSendEvent(dis, w, False, NoEventMask, &ke);
 }
 
 int main() {
     if(!(dis = XOpenDisplay(NULL))) return 1;
     setup();
-    puts("MINIME : starting up");
+    puts("MINIME : Starting up");
     startup();
     XCloseDisplay(dis);
     return 0;
